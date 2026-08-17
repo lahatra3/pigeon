@@ -1,5 +1,6 @@
 const std = @import("std");
 const linux = std.os.linux;
+const posix = std.posix;
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
@@ -333,23 +334,115 @@ pub const Handler = struct {
     }
 
     fn maybeSubmitRead(self: *Handler) !void {
-        _ = self;
+        if (self.read_in_flight) return;
+        if (self.physical_eof_reached) return;
+        if (self.gzip_stream_finished) return;
+
+        const slot_index = self.buffers.findFreeCompressed() orelse {
+            return;
+        };
+
+        const slot = self.buffers.compressedSlot(slot_index);
+
+        std.debug.assert(slot.state == .free);
+        std.debug.assert(slot.length_bytes == 0);
+
+        slot.state = .reading;
+        slot.file_offset_bytes = self.next_file_offset_bytes;
+
+        errdefer {
+            slot.state = .free;
+            slot.file_offset_bytes = 0;
+        }
+
+        const tag: Tag = switch (slot_index) {
+            0 => .disk_read_0,
+            1 => .disk_read_1,
+            else => unreachable,
+        };
+
+        const sqe = try self.ring.get_sqe();
+
+        sqe.prep_read(
+            self.file.handle,
+            slot.buffer,
+            slot.file_offset_bytes,
+        );
+
+        sqe.user_data = tag.toU64();
+
+        self.next_file_offset_bytes += slot.buffer.len;
+
+        self.read_in_flight = true;
     }
 
     fn submitPollOut(self: *Handler) !void {
-        _ = self;
+        if (self.poll_out_in_flight) return;
+
+        const sqe = try self.ring.get_sqe();
+
+        sqe.prep_poll_add(
+            self.pg.socket,
+            linux.POLL.OUT,
+        );
+
+        sqe.user_data = Tag.socket_poll_out.toU64();
+
+        self.poll_out_in_flight = true;
+        self.metris.poll_out_count += 1;
     }
 
     fn processCompletions(self: *Handler) !void {
-        _ = self;
+        var completion_count: u16 = 0;
+        const completion_limit: u16 = 128;
+
+        while (self.ring.cq_ready() > 0 and
+            completion_count < completion_limit) : (completion_count += 1)
+        {
+            const completion = try self.ring.copy_cqe();
+
+            try self.handleCompletion(completion);
+        }
     }
 
     fn handleCompletion(
         self: *Handler,
         completion: linux.io_uring_cqe,
     ) !void {
-        _ = self;
-        _ = completion;
+        if (completion.res < 0) {
+            const error_number = -completion.res;
+
+            const system_error: posix.E = @enumFromInt(error_number);
+
+            std.log.err(
+                \\ [io_uring]: operation failed...
+                \\ Tag: {d}
+                \\ Error: {s}
+                \\ Code: {d}
+            ,
+                .{
+                    completion.user_data,
+                    @tagName(system_error),
+                    error_number,
+                },
+            );
+
+            return error.IoUringOperationFailed;
+        }
+
+        const tag: Tag = @enumFromInt(completion.user_data);
+
+        switch (tag) {
+            .disk_read_0, .disk_read_1 => {
+                try self.handleDiskRead(
+                    completion,
+                    tag,
+                );
+            },
+            .socket_poll_out => {
+                try self.handlePollout();
+            },
+        }
     }
 
     fn handleDiskRead(
@@ -357,29 +450,155 @@ pub const Handler = struct {
         completion: linux.io_uring_cqe,
         tag: Tag,
     ) !void {
-        _ = self;
-        _ = completion;
-        _ = tag;
+        std.debug.assert(self.read_in_flight);
+
+        self.read_in_flight = false;
+        self.metris.disk_read_count += 1;
+
+        const slot_index: u8 = switch (tag) {
+            .disk_read_0 => 0,
+            .disk_read_1 => 1,
+            else => unreachable,
+        };
+
+        const slot = self.buffers.compressedSlot(slot_index);
+
+        std.debug.assert(slot.state == .reading);
+
+        const bytes_read: u32 = @intCast(completion.res);
+
+        if (bytes_read == 0) {
+            self.physical_eof_reached = true;
+
+            self.buffers.resetCompressedRead(slot_index);
+
+            return;
+        }
+
+        const reserved_end = slot.file_offset_bytes + slot.buffer.len;
+
+        std.debug.assert(self.next_file_offset_bytes >= reserved_end);
+
+        self.next_file_offset_bytes = slot.file_offset_bytes + bytes_read;
+
+        self.metris.compressed_bytes += bytes_read;
+
+        if (self.gzip_stream_finished) {
+            self.buffers.resetCompressedRead(slot_index);
+
+            return;
+        }
+
+        slot.length_bytes = bytes_read;
+        slot.state = .ready;
+
+        try self.maybeSubmitRead();
     }
 
     fn handlePollout(self: *Handler) !void {
-        _ = self;
+        std.debug.assert(self.poll_out_in_flight);
+
+        self.poll_out_in_flight = false;
+
+        const fully_flushed = try self.pg.flush();
+
+        if (!fully_flushed) {
+            try self.submitPollOut();
+            return;
+        }
+
+        try self.pg.consumeAvailableInput();
     }
 
     fn releaseActiveCompressedIfConsumed(self: *Handler) void {
-        _ = self;
+        if (self.active_compressed_slot) |slot_index| {
+            if (self.decompressor.hasPendingInput()) {
+                return;
+            }
+
+            self.buffers.releaseCompressed(slot_index);
+            self.active_compressed_slot = null;
+        }
     }
 
-    fn processingFinished(self: *Handler) bool {
-        _ = self;
+    fn processingFinished(self: *const Handler) bool {
+        if (!self.gzip_stream_finished) return false;
+        if (self.pending_copy_slot != null) return false;
+        if (self.active_compressed_slot != null) return false;
+
+        if (self.read_in_flight) return false;
+
         return true;
     }
 
     fn assertInvariants(self: *const Handler) void {
-        _ = self;
+        self.buffers.assertInvariants();
+
+        if (self.active_compressed_slot) |slot_index| {
+            std.debug.assert(slot_index < COMPRESSED_SLOT_COUNT);
+
+            const slot = self.buffers.compressed[slot_index];
+            std.debug.assert(
+                slot.state == .inflating,
+            );
+        }
+
+        if (self.pending_copy_slot) |slot_index| {
+            std.debug.assert(slot_index < DECOMPRESSED_SLOT_COUNT);
+
+            const slot = self.buffers.decompressed[slot_index];
+            std.debug.assert(slot.state == .pending_copy);
+
+            std.debug.assert(slot.length_bytes > 0);
+        }
+
+        var reading_count: u8 = 0;
+
+        for (self.buffers.compressed) |slot| {
+            if (slot.state == .reading) {
+                reading_count += 1;
+            }
+        }
+
+        if (self.read_in_flight) {
+            std.debug.assert(reading_count == 1);
+        } else {
+            std.debug.assert(reading_count == 0);
+        }
+
+        std.debug.assert(reading_count <= 1);
+
+        std.debug.assert(
+            !(self.gzip_stream_finished and
+                self.decompressor.hasPendingInput()),
+        );
+
+        std.debug.assert(
+            !(self.processingFinished() and
+                self.pending_copy_slot != null),
+        );
     }
 
-    fn logMetrics(self: *Handler) void {
-        _ = self;
+    fn logMetrics(self: *const Handler) void {
+        std.log.info(
+            \\ Successfully ingested...
+            \\ Compressed: {d} MiB
+            \\ Decompressed: {d} MiB
+            \\ Disk reads: {d}
+            \\ Inflate calls: {d}
+            \\ COPY attemps: {d}
+            \\ COPY would-block: {d}
+            \\ POLL.OUT: {d}
+        ,
+            .{
+                self.metris.compressed_bytes / (1024 * 1024),
+                self.metris.decompressed_bytes / (1024 * 1024),
+                self.metris.disk_read_count,
+                self.metris.inflate_count,
+                self.metris.copy_attempt_count,
+                self.metris.copy_would_block_count,
+                self.metris.poll_out_count,
+            },
+        );
     }
 };
