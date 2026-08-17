@@ -243,17 +243,96 @@ pub const Handler = struct {
         std.debug.assert(self.active_compressed_slot != null);
 
         std.debug.assert(self.pending_copy_slot == null);
+
+        const output_slot = self.buffers.decompressedSlot(output_slot_index);
+
+        std.debug.assert(output_slot.state == .free);
+        std.debug.assert(output_slot.length_bytes == 0);
+
+        output_slot.state = .filling;
+
+        const res = self.decompressor.inflateInto(output_slot.buffer);
+
+        const inflate_res = res catch |err| {
+            self.buffers.resetDecompressedFill(output_slot_index);
+
+            return err;
+        };
+
+        self.metris.inflate_count += 1;
+
+        if (inflate_res.produced_bytes > 0) {
+            output_slot.length_bytes = inflate_res.produced_bytes;
+
+            output_slot.state = .pending_copy;
+            self.pending_copy_slot = output_slot_index;
+
+            self.metris.decompressed_bytes += inflate_res.produced_bytes;
+        } else {
+            self.buffers.resetDecompressedFill(output_slot_index);
+        }
+
+        if (inflate_res.input_finished) {
+            self.releaseActiveCompressedIfConsumed();
+            try self.maybeSubmitRead();
+        }
+
+        if (inflate_res.stream_finished) {
+            self.gzip_stream_finished = true;
+            self.releaseActiveCompressedIfConsumed();
+        }
     }
 
-    fn trySendPending(self: *Handler) !bool {
-        _ = self;
+    fn trySendPending(
+        self: *Handler,
+        slot_index: u8,
+    ) !bool {
+        std.debug.assert(slot_index < DECOMPRESSED_SLOT_COUNT);
+
+        std.debug.assert(self.pending_copy_slot == slot_index);
+
+        const slot = self.buffers.decompressedSlot(slot_index);
+
+        std.debug.assert(slot.state == .pending_copy);
+
+        std.debug.assert(slot.length_bytes > 0);
+
+        const length: usize = @intCast(slot.length_bytes);
+
+        const res: PutDataResult = try self.pg.putData(slot.buffer[0..length]);
+
+        self.metris.copy_attempt_count += 1;
+
+        switch (res) {
+            .accepted => {
+                self.pending_copy_slot = null;
+                self.buffers.releaseDecompressed(slot_index);
+
+                const fully_flushed = try self.pg.flush();
+
+                if (!fully_flushed and !self.poll_out_in_flight) {
+                    try self.submitPollOut();
+                }
+
+                return true;
+            },
+            .would_block => {
+                self.metris.copy_would_block_count += 1;
+
+                const fully_flushed = try self.pg.flush();
+
+                if (!fully_flushed) {
+                    try self.submitPollOut();
+                } else {
+                    try self.submitPollOut();
+                }
+
+                return false;
+            },
+        }
     }
 
-    fn releaseActiveCompressedIfConsumed(self: *Handler) void {
-        _ = self;
-    }
-
-    fn processCompletions(self: *Handler) !void {
+    fn maybeSubmitRead(self: *Handler) !void {
         _ = self;
     }
 
@@ -261,7 +340,33 @@ pub const Handler = struct {
         _ = self;
     }
 
-    fn maybeSubmitRead(self: *Handler) !void {
+    fn processCompletions(self: *Handler) !void {
+        _ = self;
+    }
+
+    fn handleCompletion(
+        self: *Handler,
+        completion: linux.io_uring_cqe,
+    ) !void {
+        _ = self;
+        _ = completion;
+    }
+
+    fn handleDiskRead(
+        self: *Handler,
+        completion: linux.io_uring_cqe,
+        tag: Tag,
+    ) !void {
+        _ = self;
+        _ = completion;
+        _ = tag;
+    }
+
+    fn handlePollout(self: *Handler) !void {
+        _ = self;
+    }
+
+    fn releaseActiveCompressedIfConsumed(self: *Handler) void {
         _ = self;
     }
 
@@ -269,11 +374,11 @@ pub const Handler = struct {
         _ = self;
     }
 
-    fn logMetrics(self: *Handler) void {
+    fn assertInvariants(self: *Handler) void {
         _ = self;
     }
 
-    fn assertInvariants(self: *Handler) void {
+    fn logMetrics(self: *Handler) void {
         _ = self;
     }
 };
