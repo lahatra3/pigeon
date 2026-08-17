@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const Alignment = std.mem.Alignment;
 
 pub const COMPRESSED_SLOT_COUNT: u8 = 2;
 pub const DECOMPRESSED_SLOT_COUNT: u8 = 2;
@@ -49,41 +50,51 @@ pub const BufferPool = struct {
     pub fn init(allocator: Allocator) !BufferPool {
         const compressed_0 = try allocator.alignedAlloc(
             u8,
-            .@"4096",
+            Alignment.fromByteUnits(4096),
             COMPRESSED_SLOT_SIZE_BYTES,
         );
         errdefer allocator.free(compressed_0);
 
         const compressed_1 = try allocator.alignedAlloc(
             u8,
-            .@"4096",
+            Alignment.fromByteUnits(4096),
             COMPRESSED_SLOT_SIZE_BYTES,
         );
         errdefer allocator.free(compressed_1);
 
         const decompressed_0 = try allocator.alignedAlloc(
             u8,
-            .@"64",
+            Alignment.fromByteUnits(64),
             DECOMPRESSED_SLOT_SIZE_BYTES,
         );
         errdefer allocator.free(decompressed_0);
 
         const decompressed_1 = try allocator.alignedAlloc(
             u8,
-            .@"64",
+            Alignment.fromByteUnits(64),
             DECOMPRESSED_SLOT_SIZE_BYTES,
         );
         errdefer allocator.free(decompressed_1);
 
-        const pool = BufferPool{ .allocator = allocator, .compressed = .{ .{
-            .buffer = compressed_0,
-        }, .{
-            .buffer = compressed_1,
-        } }, .decompressed = .{ .{
-            .buffer = decompressed_0,
-        }, .{
-            .buffer = decompressed_1,
-        } } };
+        const pool = BufferPool{
+            .allocator = allocator,
+            .compressed = .{
+                .{
+                    .buffer = compressed_0,
+                },
+                .{
+                    .buffer = compressed_1,
+                },
+            },
+            .decompressed = .{
+                .{
+                    .buffer = decompressed_0,
+                },
+                .{
+                    .buffer = decompressed_1,
+                },
+            },
+        };
 
         pool.assertInvariants();
 
@@ -233,7 +244,7 @@ pub const BufferPool = struct {
         slot.state = .free;
     }
 
-    pub fn assertInvariants(self: *BufferPool) void {
+    pub fn assertInvariants(self: *const BufferPool) void {
         for (self.compressed) |slot| {
             std.debug.assert(
                 slot.buffer.len == COMPRESSED_SLOT_SIZE_BYTES,

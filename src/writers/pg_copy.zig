@@ -72,6 +72,7 @@ pub const PgCopyIn = struct {
         if (c.PQsendQuery(self.conn_handle, query.ptr) == 0) {
             std.log.err(
                 \\ [PostgreSQL]: sending query failed...
+                \\  Error: {s}
             ,
                 .{std.mem.span(c.PQerrorMessage(self.conn_handle))},
             );
@@ -150,6 +151,7 @@ pub const PgCopyIn = struct {
                 ,
                     .{std.mem.span(c.PQerrorMessage(self.conn_handle))},
                 );
+                return error.PostgresqlPutCopyDataFailed;
             },
         };
     }
@@ -161,6 +163,7 @@ pub const PgCopyIn = struct {
             else => {
                 std.log.err(
                     \\ [PostgreSQL]: flushing data failed...
+                    \\  Error: {s}
                 ,
                     .{std.mem.span(c.PQerrorMessage(self.conn_handle))},
                 );
@@ -276,7 +279,7 @@ pub const PgCopyIn = struct {
                 c.PQclear(res);
                 return error.PostgresqlCopyFailed;
             }
-            
+
             c.PQclear(res);
         }
 
@@ -320,13 +323,13 @@ pub const PgCopyIn = struct {
 
         while (true) {
             descriptors[0].revents = 0;
-            
+
             const ready_count = posix.poll(
                 descriptors[0..],
                 -1,
             ) catch |err| switch (err) {
-                error.Interrupted => continue,
-                else => return err,
+                error.NetworkDown, error.SystemResources => continue,
+                error.Unexpected => return err,
             };
 
             std.debug.assert(ready_count <= 1);
@@ -342,7 +345,8 @@ pub const PgCopyIn = struct {
             if ((returned & posix.POLL.ERR) != 0) {
                 std.log.err(
                     \\ [PostgreSQL]: socket poll error...
-                    , .{},
+                ,
+                    .{},
                 );
 
                 return error.PostgresqlSocketPollFailed;

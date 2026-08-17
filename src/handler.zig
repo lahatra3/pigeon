@@ -370,11 +370,12 @@ pub const Handler = struct {
         _ = self;
     }
 
-    fn processingFinished(self: *Handler) !void {
+    fn processingFinished(self: *Handler) bool {
         _ = self;
+        return true;
     }
 
-    fn assertInvariants(self: *Handler) void {
+    fn assertInvariants(self: *const Handler) void {
         _ = self;
     }
 
